@@ -1,6 +1,6 @@
 import os
 import json
-from typing import Callable, Awaitable
+from typing import Callable
 from core import MRKTClient
 
 DATA_DIR = "data"

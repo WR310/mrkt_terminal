@@ -9,6 +9,7 @@ import aiohttp
 from typing import Callable
 
 from core import MRKTClient
+from database import log_trade, init_db
 
 DATA_DIR = "data"
 ASSETS_FILE = os.path.join(DATA_DIR, "assets.json")
@@ -41,7 +42,7 @@ async def send_tg_alert(message: str):
 
 
 def _extract_price_nano(lot: dict) -> int | None:
-    for key in ("priceNanoTons", "priceNano", "price", "salePrice"):
+    for key in ("priceNanoTONs", "priceNanoTons", "priceNano", "price", "salePrice"):
         v = lot.get(key)
         if isinstance(v, (int, float)) and v > 0:
             return int(v)
@@ -64,6 +65,7 @@ async def run_sniper(
     delay_between: float = 1.0,
     undercut_nano: int = 1,
 ):
+    init_db()
     log(f"[*] Снайпер заряжен. Ищем цели со скидкой от {target_discount_percent}%...")
 
     if not os.path.exists(ASSETS_FILE):
@@ -81,7 +83,6 @@ async def run_sniper(
         log("[!] База активов пуста.")
         return
 
-    # --- УМНЫЙ ФИЛЬТР БЮДЖЕТА ---
     try:
         current_balance = await client.get_balance()
         log(
@@ -169,6 +170,18 @@ async def run_sniper(
                     log(f"   [✓] ФЛИП ЗАВЕРШЕН: {title} снова на витрине.\n")
 
                     profit_ton = sell_ton - buy_ton
+
+                    # === Запись в Trade Journal ===
+                    log_trade(
+                        trade_type="flip",
+                        collection=title,
+                        price_ton=buy_ton,
+                        profit_ton=profit_ton,
+                        backdrop=cheapest.get("backdropName"),
+                        model=cheapest.get("modelName"),
+                        extra=f"sell_ton={sell_ton:.4f}",
+                    )
+
                     alert_msg = (
                         f"🎯 <b>ЦЕЛЬ ПОРАЖЕНА: {title}</b>\n\n"
                         f"🛒 <b>Куплен за:</b> {buy_ton:.3f} TON\n"

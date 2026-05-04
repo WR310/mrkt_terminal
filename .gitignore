@@ -1,5 +1,4 @@
 .env
+*.session
 __pycache__/
-*.pyc
-.venv/
-venv/
+data/

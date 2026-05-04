@@ -13,8 +13,11 @@ LogFn = Callable[[str], None]
 
 
 def _extract_price_nano(lot: dict) -> int | None:
-    """Достаёт цену лота в наноТОНах из разных возможных полей."""
-    for key in ("priceNanoTons", "priceNano", "price", "salePrice"):
+    """
+    Достаёт цену лота в нано-тонах.
+    Главный ключ MRKT API — priceNanoTONs (с заглавными TON).
+    """
+    for key in ("priceNanoTONs", "priceNanoTons", "priceNano", "price", "salePrice"):
         v = lot.get(key)
         if isinstance(v, (int, float)) and v > 0:
             return int(v)
@@ -28,11 +31,6 @@ def _extract_sale_id(lot: dict) -> str | None:
         if isinstance(v, str) and v:
             return v
     return None
-
-
-import os
-import json
-import asyncio
 
 
 async def clear_all_offers(client, log_func):
@@ -54,10 +52,7 @@ async def clear_all_offers(client, log_func):
             continue
 
         try:
-            # Запрашиваем стакан коллекции
             orders = await client.get_collection_orders(collection, count=50)
-
-            # Ищем только свои ставки через наш любимый флаг isMine
             my_orders = [o for o in orders if o.get("isMine")]
 
             for order in my_orders:
@@ -71,7 +66,6 @@ async def clear_all_offers(client, log_func):
         except Exception as e:
             log_func(f"   [X] Ошибка проверки {collection[:10]}: {e}")
 
-        # Пауза между коллекциями, чтобы сервер не забанил за спам
         await asyncio.sleep(1)
 
     log_func(
@@ -114,7 +108,6 @@ async def run_mass_offers(
 
     multiplier = 1.0 - (discount_percent / 100.0)
 
-    # --- ПРЕДВАРИТЕЛЬНЫЙ ФИЛЬТР БЮДЖЕТА ---
     affordable_assets = []
     for asset in assets:
         floor_nano = asset.get("floorPriceNanoTons") or asset.get("floorPriceNano")
@@ -146,7 +139,6 @@ async def run_mass_offers(
             lots = await client.get_listings(
                 collection_name=name,
                 count=5,
-                cursor="",
                 ordering="Price",
                 low_to_high=True,
             )
@@ -195,7 +187,6 @@ async def run_mass_offers(
                 }
             )
 
-            # Уменьшаем виртуальный баланс
             current_balance -= offer_ton
 
         except Exception as e:

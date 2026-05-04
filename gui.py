@@ -1,13 +1,18 @@
 import asyncio
+import logging
 import threading
 import customtkinter as ctk
 
+from watcher import run_watcher
 from core import MRKTClient
 from scanner import scan_liquidity
 from order_bot import run_mass_offers, clear_all_offers
 from flipper import run_auto_flip
-from sniper import run_sniper  # [SNIPER] Восстановлен импорт
-from engine import run_engine  # [ENGINE] Фоновый Ордер-Движок
+from sniper import run_sniper
+from engine import run_engine
+from config_manager import load_config, save_config, update_value
+from controller import TerminalController
+from tg_bot import TelegramBot
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
@@ -36,6 +41,21 @@ class MRKTTerminal(ctk.CTk):
 
         self.client = MRKTClient()
 
+        # === Контроллер (общий фасад для GUI и Telegram) ===
+        self.controller = TerminalController(self.client, self.loop)
+
+        # === Telegram-бот (опционально, если есть .env) ===
+        self.tg_bot: TelegramBot | None = None
+        try:
+            self.tg_bot = TelegramBot(self.controller)
+            self.run_async(self.tg_bot.start())
+            logging.getLogger("MRKT").info("Telegram-бот запущен в фоне")
+        except Exception as e:
+            logging.getLogger("MRKT").warning(f"Telegram-бот не запущен: {e}")
+
+        # === Загружаем сохранённые настройки ===
+        self.config = load_config()
+
         # Сетка: сайдбар + контент
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -43,6 +63,12 @@ class MRKTTerminal(ctk.CTk):
         self._build_sidebar()
         self._build_frames()
         self.show_frame("dashboard")
+
+        # Прокидываем GUI-логгеры в контроллер, чтобы из бота тоже шло в Textbox
+        self.controller.engine_logger = self._log_engine
+        self.controller.sniper_logger = self._log_sniper
+        self.controller.offers_logger = self._log_offers
+        self.controller.scan_logger = self._log
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -59,27 +85,30 @@ class MRKTTerminal(ctk.CTk):
         self.is_engine_running = False
 
         async def shutdown_tasks():
-            # Закрываем сессию связи с сервером
+            # Сначала останавливаем Telegram-бота, чтобы он не цеплял уже закрытый клиент
+            if self.tg_bot is not None:
+                try:
+                    await self.tg_bot.stop()
+                except Exception:
+                    pass
+
             await self.client.close()
-            # Ищем все фоновые задачи, которые еще висят в памяти (Движок, Снайпер и т.д.)
             tasks = [
                 t
                 for t in asyncio.all_tasks(self.loop)
                 if t is not asyncio.current_task(self.loop)
             ]
             for task in tasks:
-                task.cancel()  # Жестко отменяем их
+                task.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
 
         try:
-            # Запускаем процедуру зачистки с таймаутом 3 секунды
             fut = asyncio.run_coroutine_threadsafe(shutdown_tasks(), self.loop)
             fut.result(timeout=3)
         except Exception:
             pass
 
-        # Останавливаем цикл и убиваем окно
         self.loop.call_soon_threadsafe(self.loop.stop)
         self.destroy()
 
@@ -164,19 +193,17 @@ class MRKTTerminal(ctk.CTk):
     def _build_dashboard(self) -> ctk.CTkFrame:
         frame = ctk.CTkFrame(self, corner_radius=12)
         frame.grid_columnconfigure(0, weight=1)
-        frame.grid_rowconfigure(3, weight=1)  # Растягиваем окно под список инвентаря
+        frame.grid_rowconfigure(3, weight=1)
 
         header = ctk.CTkLabel(
             frame, text="Дашборд и Портфель", font=ctk.CTkFont(size=26, weight="bold")
         )
         header.grid(row=0, column=0, padx=24, pady=(24, 12), sticky="w")
 
-        # Карточка со статистикой в 3 колонки
         stats_card = ctk.CTkFrame(frame, corner_radius=10)
         stats_card.grid(row=1, column=0, padx=24, pady=12, sticky="ew")
         stats_card.grid_columnconfigure((0, 1, 2), weight=1)
 
-        # Колонки статистики
         ctk.CTkLabel(
             stats_card,
             text="Свободный баланс",
@@ -216,7 +243,6 @@ class MRKTTerminal(ctk.CTk):
         )
         self.items_count.grid(row=1, column=2, padx=20, pady=(0, 18), sticky="w")
 
-        # Панель управления
         controls = ctk.CTkFrame(frame, fg_color="transparent")
         controls.grid(row=2, column=0, padx=24, pady=4, sticky="ew")
 
@@ -232,7 +258,6 @@ class MRKTTerminal(ctk.CTk):
         self.dashboard_status = ctk.CTkLabel(controls, text="", text_color="#9aa0a6")
         self.dashboard_status.grid(row=0, column=1, padx=16, sticky="w")
 
-        # Текстовое окно для списка NFT
         self.inventory_log = ctk.CTkTextbox(
             frame, wrap="none", font=ctk.CTkFont(family="Consolas", size=13)
         )
@@ -273,7 +298,7 @@ class MRKTTerminal(ctk.CTk):
     def _build_engine(self) -> ctk.CTkFrame:
         frame = ctk.CTkFrame(self, corner_radius=12)
         frame.grid_columnconfigure(0, weight=1)
-        frame.grid_rowconfigure(5, weight=1)  # Лог теперь в row=5 (добавили блок фонов)
+        frame.grid_rowconfigure(5, weight=1)
 
         header = ctk.CTkLabel(
             frame,
@@ -290,7 +315,7 @@ class MRKTTerminal(ctk.CTk):
         ctk.CTkLabel(
             slider_box, text="Скидка от floor:", font=ctk.CTkFont(size=14)
         ).grid(row=0, column=0, padx=(16, 12), pady=14, sticky="w")
-        self.engine_discount_value = 15.0
+        self.engine_discount_value = float(self.config.get("engine_discount", 15.0))
         self.engine_discount_label = ctk.CTkLabel(
             slider_box,
             text=f"{self.engine_discount_value:.0f} %",
@@ -310,7 +335,7 @@ class MRKTTerminal(ctk.CTk):
         self.engine_discount_slider.set(self.engine_discount_value)
         self.engine_discount_slider.grid(row=0, column=1, padx=8, pady=14, sticky="ew")
 
-        # [ENGINE] Блок фильтра фонов (Backdrops)
+        # Блок фильтра фонов
         bg_box = ctk.CTkFrame(frame, corner_radius=10)
         bg_box.grid(row=2, column=0, padx=24, pady=8, sticky="ew")
         bg_box.grid_columnconfigure((1, 2, 3, 4), weight=0)
@@ -322,9 +347,10 @@ class MRKTTerminal(ctk.CTk):
         ).grid(row=0, column=0, padx=(16, 12), pady=14, sticky="w")
 
         bg_options = ["Любой", "Black", "Gold", "Satin Gold"]
+        saved_bgs = self.config.get("engine_backdrops", {})
         for idx, bg_name in enumerate(bg_options):
-            # По умолчанию галочка только на "Любой"
-            var = ctk.BooleanVar(value=(bg_name == "Любой"))
+            default_val = bool(saved_bgs.get(bg_name, bg_name == "Любой"))
+            var = ctk.BooleanVar(value=default_val)
             self.engine_bg_vars[bg_name] = var
 
             cb = ctk.CTkCheckBox(
@@ -362,7 +388,6 @@ class MRKTTerminal(ctk.CTk):
         )
         self.engine_status.grid(row=0, column=1, padx=(8, 0), pady=0, sticky="w")
 
-        # Подсказка
         hint = ctk.CTkLabel(
             frame,
             text="Движок работает в фоне: автоматически держит офферы по заданной скидке.",
@@ -371,7 +396,6 @@ class MRKTTerminal(ctk.CTk):
         )
         hint.grid(row=4, column=0, padx=24, pady=(0, 4), sticky="w")
 
-        # Лог движка
         self.engine_log = ctk.CTkTextbox(
             frame, wrap="none", font=ctk.CTkFont(family="Consolas", size=12)
         )
@@ -380,31 +404,29 @@ class MRKTTerminal(ctk.CTk):
 
         return frame
 
-    # [ENGINE] Логика взаимоисключения чекбоксов фильтра фонов
+    # Логика взаимоисключения чекбоксов фильтра фонов + персист
     def _on_bg_toggle(self, changed_bg: str):
         any_var = self.engine_bg_vars.get("Любой")
-        specific_keys = [k for k in self.engine_bg_vars.keys() if k != "Любой"]
 
         if changed_bg == "Любой":
-            # Если "Любой" стал True -> сбрасываем все остальные
+            if any_var is None:
+                return
             if any_var.get():
-                for k in specific_keys:
-                    self.engine_bg_vars[k].set(False)
-            else:
-                # Сняли галочку с "Любой", а конкретных нет -> возвращаем "Любой"
-                if not any(self.engine_bg_vars[k].get() for k in specific_keys):
-                    any_var.set(True)
+                for bg, var in self.engine_bg_vars.items():
+                    if bg != "Любой":
+                        var.set(False)
         else:
-            # Нажали по конкретному цвету
-            if self.engine_bg_vars[changed_bg].get():
-                # Включили конкретный -> снимаем "Любой"
+            changed_var = self.engine_bg_vars.get(changed_bg)
+            if changed_var is not None and changed_var.get():
                 if any_var is not None:
                     any_var.set(False)
-            else:
-                # Сняли конкретный -> если все конкретные пусты, возвращаем "Любой"
-                if not any(self.engine_bg_vars[k].get() for k in specific_keys):
-                    if any_var is not None:
-                        any_var.set(True)
+
+        # Персист одной транзакцией
+        snapshot = {name: var.get() for name, var in self.engine_bg_vars.items()}
+        cfg = load_config()
+        cfg["engine_backdrops"] = snapshot
+        save_config(cfg)
+        self.config = cfg
 
     # --- Массовые операции ---
     def _build_mass_ops(self) -> ctk.CTkFrame:
@@ -419,7 +441,6 @@ class MRKTTerminal(ctk.CTk):
         )
         header.grid(row=0, column=0, padx=24, pady=(24, 12), sticky="w")
 
-        # Ползунок скидки для массовых офферов
         slider_box = ctk.CTkFrame(frame, corner_radius=10)
         slider_box.grid(row=1, column=0, padx=24, pady=8, sticky="ew")
         slider_box.grid_columnconfigure(1, weight=1)
@@ -427,7 +448,7 @@ class MRKTTerminal(ctk.CTk):
         ctk.CTkLabel(
             slider_box, text="Скидка от floor:", font=ctk.CTkFont(size=14)
         ).grid(row=0, column=0, padx=(16, 12), pady=14, sticky="w")
-        self.offers_discount_value = 15.0
+        self.offers_discount_value = float(self.config.get("offers_discount", 15.0))
         self.offers_discount_label = ctk.CTkLabel(
             slider_box,
             text=f"{self.offers_discount_value:.0f} %",
@@ -447,7 +468,6 @@ class MRKTTerminal(ctk.CTk):
         self.offers_discount_slider.set(self.offers_discount_value)
         self.offers_discount_slider.grid(row=0, column=1, padx=8, pady=14, sticky="ew")
 
-        # Кнопки
         controls_box = ctk.CTkFrame(frame, corner_radius=10, fg_color="transparent")
         controls_box.grid(row=2, column=0, padx=24, pady=(8, 4), sticky="ew")
 
@@ -482,11 +502,9 @@ class MRKTTerminal(ctk.CTk):
         )
         self.flip_btn.grid(row=0, column=2, padx=0, pady=0, sticky="w")
 
-        # Статус
         self.offers_status = ctk.CTkLabel(frame, text="", text_color="#9aa0a6")
         self.offers_status.grid(row=3, column=0, padx=24, pady=4, sticky="w")
 
-        # Лог массовых операций
         self.offers_log = ctk.CTkTextbox(
             frame, wrap="none", font=ctk.CTkFont(family="Consolas", size=12)
         )
@@ -515,7 +533,7 @@ class MRKTTerminal(ctk.CTk):
         ctk.CTkLabel(
             slider_box, text="Целевая скидка (от флора):", font=ctk.CTkFont(size=14)
         ).grid(row=0, column=0, padx=(16, 12), pady=14, sticky="w")
-        self.sniper_discount_val = 20.0
+        self.sniper_discount_val = float(self.config.get("sniper_discount", 20.0))
         self.sniper_discount_lbl = ctk.CTkLabel(
             slider_box,
             text=f"{self.sniper_discount_val:.0f} %",
@@ -581,7 +599,7 @@ class MRKTTerminal(ctk.CTk):
         frame = ctk.CTkFrame(self, corner_radius=12)
         frame.grid_columnconfigure(0, weight=1)
 
-        self.calc_undercut_ton = 0.001
+        self.calc_undercut_ton = float(self.config.get("calc_undercut_ton", 0.001))
 
         header = ctk.CTkLabel(
             frame, text="Калькулятор Снайпера", font=ctk.CTkFont(size=26, weight="bold")
@@ -616,7 +634,7 @@ class MRKTTerminal(ctk.CTk):
         ctk.CTkLabel(
             input_box, text="Целевой дисконт (%):", font=ctk.CTkFont(size=14)
         ).grid(row=1, column=0, padx=(16, 12), pady=8, sticky="w")
-        self.calc_discount_value = 15.0
+        self.calc_discount_value = float(self.config.get("calc_discount", 15.0))
         self.calc_discount_slider = ctk.CTkSlider(
             input_box,
             from_=1,
@@ -642,7 +660,7 @@ class MRKTTerminal(ctk.CTk):
         ).grid(row=2, column=0, padx=(16, 12), pady=(8, 16), sticky="w")
         ctk.CTkLabel(
             input_box,
-            text="0.001 TON",
+            text=f"{self.calc_undercut_ton:.3f} TON",
             font=ctk.CTkFont(size=14, weight="bold"),
             text_color="#f1c40f",
         ).grid(row=2, column=1, columnspan=2, padx=(0, 16), pady=(8, 16), sticky="w")
@@ -777,18 +795,22 @@ class MRKTTerminal(ctk.CTk):
     def _on_engine_discount_change(self, value: float):
         self.engine_discount_value = float(value)
         self.engine_discount_label.configure(text=f"{self.engine_discount_value:.0f} %")
+        update_value("engine_discount", self.engine_discount_value)
 
     def _on_offers_discount_change(self, value: float):
         self.offers_discount_value = float(value)
         self.offers_discount_label.configure(text=f"{self.offers_discount_value:.0f} %")
+        update_value("offers_discount", self.offers_discount_value)
 
     def _on_sniper_discount_change(self, value: float):
         self.sniper_discount_val = float(value)
         self.sniper_discount_lbl.configure(text=f"{self.sniper_discount_val:.0f} %")
+        update_value("sniper_discount", self.sniper_discount_val)
 
     def _on_calc_discount_change(self, value: float):
         self.calc_discount_value = float(value)
         self.calc_discount_label.configure(text=f"{self.calc_discount_value:.0f} %")
+        update_value("calc_discount", self.calc_discount_value)
 
     # ---------- Исполнительные методы ----------
     def _refresh_dashboard(self):
@@ -803,13 +825,11 @@ class MRKTTerminal(ctk.CTk):
 
         async def task():
             try:
-                # 1. Запрашиваем баланс кошелька
                 bal = await self.client.get_balance()
                 self.after(
                     0, lambda: self.balance_value.configure(text=f"{bal:.3f} TON")
                 )
 
-                # 2. Вытягиваем инвентарь
                 gifts = await self.client.get_inventory()
 
                 total_value_nano = 0
@@ -823,7 +843,6 @@ class MRKTTerminal(ctk.CTk):
                         num = gift.get("number", "—")
                         model = gift.get("modelName", "—")
 
-                        # Берем цену флора прямо из ответа сервера (умно!)
                         floor_nano = gift.get("floorPriceNanoTONsByCollection", 0) or 0
                         total_value_nano += floor_nano
                         floor_ton = floor_nano / 10**9
@@ -832,7 +851,6 @@ class MRKTTerminal(ctk.CTk):
 
                 total_value_ton = total_value_nano / 10**9
 
-                # Обновляем UI
                 self.after(
                     0,
                     lambda: self.portfolio_value.configure(
@@ -961,10 +979,9 @@ class MRKTTerminal(ctk.CTk):
 
         self.run_async(task())
 
-    # [ENGINE] Тогл-кнопка фонового Ордер-Движка
+    # Тогл-кнопка фонового Ордер-Движка
     def _toggle_engine(self):
         if not self.is_engine_running:
-            # ВКЛЮЧАЕМ ДВИЖОК
             self.is_engine_running = True
             self.engine_btn.configure(
                 text="Остановить Движок",
@@ -976,10 +993,8 @@ class MRKTTerminal(ctk.CTk):
 
             async def task():
                 try:
-                    # Считываем ползунок движка
                     discount = float(self.engine_discount_value)
 
-                    # [ENGINE] Собираем список выбранных фонов
                     if (
                         self.engine_bg_vars.get("Любой")
                         and self.engine_bg_vars["Любой"].get()
@@ -997,12 +1012,18 @@ class MRKTTerminal(ctk.CTk):
                     else:
                         self._log_engine("[i] Фильтр фонов: Любой (без ограничений)")
 
+                    asyncio.create_task(
+                        run_watcher(
+                            self.client, is_running_flag=lambda: self.is_engine_running
+                        )
+                    )
+
                     await run_engine(
                         self.client,
-                        discount_percent=discount,  # <-- Передаем скидку в мотор
+                        discount_percent=discount,
                         log=self._log_engine,
                         is_running_flag=lambda: self.is_engine_running,
-                        target_backdrops=selected_bgs,  # <-- [ENGINE] Передаем фильтр фонов
+                        target_backdrops=selected_bgs,
                     )
                 except Exception as e:
                     self._log_engine(f"[!] Критическая ошибка Движка: {e}")
@@ -1025,7 +1046,6 @@ class MRKTTerminal(ctk.CTk):
 
             self.run_async(task())
         else:
-            # ВЫКЛЮЧАЕМ ДВИЖОК (флаг → False, сам цикл выйдет на ближайшей проверке)
             self.is_engine_running = False
             self.engine_btn.configure(
                 text="Запустить Движок",

@@ -14,22 +14,46 @@ ELITE_PAIRS = {
     "Neon Cube": ["Purple", "Toxic Green"],
 }
 
-# Слова для пропуска при текстовом поиске монохромов
-GENERIC_WORDS = {"standard", "gradient", "simple", "gift", "common", "background"}
+# Список «дженерик»-слов, которые игнорируем при сравнении
+GENERIC_WORDS = {
+    "the",
+    "of",
+    "and",
+    "a",
+    "an",
+    "blue",
+    "red",
+    "green",
+    "black",
+    "white",
+    "gold",
+    "silver",
+    "light",
+    "dark",
+    "deep",
+    "pale",
+    "bright",
+}
 
 
 def is_monochrome_check(model_name: str, backdrop_name: str) -> bool:
-    if model_name in ELITE_PAIRS:
-        if backdrop_name in ELITE_PAIRS[model_name]:
-            return True
+    """
+    Проверяет, является ли пара (модель, фон) монохромной.
+    Монохром = в имени модели и в имени фона есть совпадающий
+    значимый токен (НЕ из GENERIC_WORDS).
+    """
+    if not model_name or not backdrop_name:
+        return False
 
-    m_lower = model_name.lower()
-    b_words = backdrop_name.lower().split()
+    m_words = set(model_name.lower().split())
+    b_words = set(backdrop_name.lower().split())
 
     for word in b_words:
         if word in GENERIC_WORDS:
             continue
-        if word in m_lower:
+        if len(word) < 3:
+            continue
+        if word in m_words:
             return True
 
     return False
@@ -67,7 +91,7 @@ async def run_auto_flip(client, log_func):
                 )
                 continue
 
-            # ШАГ 3: Защита от неизвестного (если фона нет ни в элите, ни в мусоре)
+            # ШАГ 3: Защита от неизвестного
             if bg not in TRASH_BACKDROPS:
                 log_func(
                     f"   [🛡️ НЕИЗВЕСТНЫЙ ФОН] {collection[:12]} | Фон: {bg} -> В СЕЙФ!"

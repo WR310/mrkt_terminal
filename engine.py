@@ -2,6 +2,20 @@ import os
 import json
 import asyncio
 
+from telegram_notify import send_telegram_notification
+from database import log_trade, init_db
+
+# ============================================================
+# Шаги ставок в нано-тонах
+# ============================================================
+STEP_FIRST_BID_NANO = 10_000_000  # 0.01 TON  — первая ставка в коллекции
+STEP_OVERBID_NANO = 2_000_000  # 0.002 TON — перебивка чужой ставки
+
+# ============================================================
+# Ресинк баланса
+# ============================================================
+DIRTY_OPS_LIMIT = 10  # после стольких ставок/отмен — принудительный ресинк
+
 ASSETS_FILE = os.path.join("data", "assets.json")
 
 
@@ -12,30 +26,44 @@ async def run_engine(
     is_running_flag,
     target_backdrops: list[str] | None = None,
 ):
-    log(
-        f"[*] ОРДЕР-ДВИЖОК ЗАПУЩЕН. Целевая скидка: {discount_percent}%. Выходим на ковер..."
+    init_db()
+
+    def log_and_notify(message: str, notify: bool = False) -> None:
+        log(message)
+        if notify:
+            asyncio.create_task(send_telegram_notification(message))
+
+    log_and_notify(
+        f"[*] ОРДЕР-ДВИЖОК ЗАПУЩЕН. Целевая скидка: {discount_percent}%. Выходим на ковер...",
+        notify=True,
     )
 
     if not os.path.exists(ASSETS_FILE):
-        log("[!] Нет базы assets.json. Сначала запустите сканер.")
+        log_and_notify(
+            "[!] Нет базы assets.json. Сначала запустите сканер.", notify=True
+        )
         return
 
     with open(ASSETS_FILE, "r", encoding="utf-8") as f:
         assets = json.load(f)
 
-    step_nano = 10_000_000  # Шаг атаки: +0.01 TON
     too_expensive = set()
 
-    # Защита от None
     target_backdrops = target_backdrops or []
 
+    dirty_ops = 0
+
     while is_running_flag():
+        # --- Жёсткий ресинк баланса в начале каждого круга ---
         try:
             current_balance = await client.get_balance()
         except Exception as e:
-            log(f"[!] Ошибка связи с банком: {e}")
+            log_and_notify(f"[!] Ошибка связи с банком: {e}", notify=True)
             await asyncio.sleep(5)
             continue
+
+        log(f"[ENGINE] 💰 Баланс на старте круга: {current_balance:.4f} TON")
+        dirty_ops = 0
 
         affordable_count = 0
 
@@ -53,20 +81,16 @@ async def run_engine(
             if collection in too_expensive:
                 continue
 
-            # Определяем, какие фоны сканировать для этой коллекции.
-            # Если фильтр пустой, сканируем 1 раз без фона (None).
             bgs_to_scan = target_backdrops if target_backdrops else [None]
 
             for bg in bgs_to_scan:
                 if not is_running_flag():
                     break
 
-                # Формируем префикс для красивого лога
                 bg_label = f"[{bg}] " if bg else ""
                 bg_list = [bg] if bg else []
 
                 try:
-                    # 1. Запрашиваем флор конкретно по этому цвету
                     lots = await client.get_listings(
                         collection,
                         count=1,
@@ -80,7 +104,6 @@ async def run_engine(
                         )
                         continue
 
-                    # Извлекаем цену.
                     floor_nano = (
                         lots[0].get("priceNanoTONs") or lots[0].get("salePrice") or 0
                     )
@@ -94,19 +117,16 @@ async def run_engine(
                     max_bid_nano = int(floor_nano * multiplier)
                     max_bid_ton = max_bid_nano / 10**9
 
-                    # ФИЛЬТР БАЛАНСА
                     if max_bid_ton > current_balance:
                         log(
                             f"   [skip] {collection[:15]:<15} {bg_label}| Тяжеловес ({max_bid_ton:.2f} TON)."
                         )
-                        # Кидаем в черный список только базовые коллекции, чтобы дорогие фоны не блокировали дешевые
                         if not bg:
                             too_expensive.add(collection)
                         continue
 
                     affordable_count += 1
 
-                    # 2. Сканируем стакан конкретно по этому цвету
                     orders = await client.get_collection_orders(
                         collection, backdrop_names=bg_list
                     )
@@ -127,19 +147,35 @@ async def run_engine(
                         continue
 
                     if highest_comp_bid >= max_bid_nano:
-                        log(
-                            f"   [!] {collection[:15]:<15} {bg_label}| Конкурент ({highest_comp_bid/10**9:.3f}) пробил стоп-кран ({max_bid_ton:.3f})."
+                        msg = (
+                            f"   [!] {collection[:15]:<15} {bg_label}| "
+                            f"Конкурент ({highest_comp_bid/10**9:.3f}) пробил стоп-кран ({max_bid_ton:.3f})."
                         )
+                        log(msg)
+
                         if my_active_id:
-                            log(f"   [-] Снимаем свою ставку. Отступаем.")
+                            cancel_msg = f"   [-] Снимаем свою ставку. Отступаем."
+                            log_and_notify(cancel_msg, notify=True)
                             await client.cancel_collection_order(my_active_id)
-                            current_balance += my_bid / 10**9
+                            dirty_ops += 1
+
+                            if dirty_ops >= DIRTY_OPS_LIMIT:
+                                try:
+                                    current_balance = await client.get_balance()
+                                    log(
+                                        f"[ENGINE] 🔄 Ресинк баланса: {current_balance:.4f} TON"
+                                    )
+                                except Exception as e:
+                                    log(f"[ENGINE] ⚠️ Ресинк баланса упал: {e}")
+                                dirty_ops = 0
+
                         await asyncio.sleep(1.5)
                         continue
 
-                    new_bid_nano = highest_comp_bid + step_nano
                     if highest_comp_bid == 0:
-                        new_bid_nano = int(floor_nano * 0.50)
+                        new_bid_nano = STEP_FIRST_BID_NANO
+                    else:
+                        new_bid_nano = highest_comp_bid + STEP_OVERBID_NANO
 
                     if new_bid_nano > max_bid_nano:
                         new_bid_nano = max_bid_nano
@@ -158,17 +194,48 @@ async def run_engine(
 
                     if my_active_id:
                         await client.cancel_collection_order(my_active_id)
-                        current_balance += my_bid / 10**9
+                        dirty_ops += 1
                         await asyncio.sleep(0.5)
 
-                    # 3. Делаем ставку с указанием цвета
                     await client.create_collection_order(
                         collection, new_bid_nano, backdrop_name=bg
                     )
                     current_balance -= new_bid_ton
+                    dirty_ops += 1
+
+                    # === Запись в Trade Journal: факт постановки ставки ===
+                    log_trade(
+                        trade_type="bid",
+                        collection=collection,
+                        price_ton=new_bid_ton,
+                        backdrop=bg,
+                        extra=f"floor_ton={floor_nano/10**9:.4f};max_bid_ton={max_bid_ton:.4f}",
+                    )
+
+                    notify_text = (
+                        f"✅ Ставка выставлена\n"
+                        f"Коллекция: {collection}\n"
+                        f"Фон: {bg if bg else '-'}\n"
+                        f"Ставка: {new_bid_ton:.3f} TON\n"
+                        f"Флор: {floor_nano / 10**9:.3f} TON\n"
+                        f"Лимит: {max_bid_ton:.3f} TON"
+                    )
+                    log_and_notify(notify_text, notify=True)
+
+                    if dirty_ops >= DIRTY_OPS_LIMIT:
+                        try:
+                            current_balance = await client.get_balance()
+                            log(
+                                f"[ENGINE] 🔄 Ресинк баланса: {current_balance:.4f} TON"
+                            )
+                        except Exception as e:
+                            log(f"[ENGINE] ⚠️ Ресинк баланса упал: {e}")
+                        dirty_ops = 0
 
                 except Exception as e:
-                    log(f"   [X] Ошибка ({collection[:10]}): {e}")
+                    log_and_notify(
+                        f"   [X] Ошибка ({collection[:10]}): {e}", notify=True
+                    )
 
                 await asyncio.sleep(2.5)
 
@@ -180,4 +247,4 @@ async def run_engine(
                 break
             await asyncio.sleep(1)
 
-    log("\n[i] Движок остановлен. Вышли из партера.")
+    log_and_notify("\n[i] Движок остановлен. Вышли из партера.", notify=True)

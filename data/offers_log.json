@@ -1,1 +1,29 @@
-[]
+[
+  {
+    "collection": "Vice Cream",
+    "title": "Vice Cream",
+    "saleId": "5b8dba7a-202a-460c-ad5e-17fa2e520144",
+    "floorTon": 2.58,
+    "offerTon": 2.322,
+    "status": "ok",
+    "response": {
+      "raw": null
+    }
+  },
+  {
+    "collection": "Chill Flame",
+    "status": "insufficient_funds"
+  },
+  {
+    "collection": "Pool Float",
+    "status": "insufficient_funds"
+  },
+  {
+    "collection": "Ice Cream",
+    "status": "insufficient_funds"
+  },
+  {
+    "collection": "Mood Pack",
+    "status": "insufficient_funds"
+  }
+]
