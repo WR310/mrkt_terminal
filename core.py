@@ -8,50 +8,56 @@ load_dotenv()
 
 BASE_URL = "https://api.tgmrkt.io/api/v1"
 
+NANO = 1_000_000_000  # 1 TON = 1e9 nanoTON
+
 _CHROME_UA = (
     "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 )
 
-
 _NO_TOKEN_MSG = (
     "[!] Боезапас пуст: переменная MRKT_TOKEN не задана в .env.\n"
-    "    Как добыть свежий токен:\n"
-    "      1. Открой MRKT (https://cdn.tgmrkt.io/) в десктопном Telegram Web (или в браузере).\n"
-    "      2. Нажми F12 → вкладка Network → отфильтруй по 'api.tgmrkt.io'.\n"
-    "      3. В любом запросе скопируй значение заголовка 'authorization' целиком.\n"
-    "      4. Вставь его в .env строкой:  MRKT_TOKEN=<твой_токен>\n"
-    "      5. Перезапусти терминал."
+    "    1. Открой MRKT (https://cdn.tgmrkt.io/) в Telegram Web.\n"
+    "    2. F12 → Network → фильтр 'api.tgmrkt.io' → скопируй заголовок 'authorization'.\n"
+    "    3. Вставь его в .env как  MRKT_TOKEN=<token>\n"
+    "    4. Перезапусти терминал."
 )
 
-_EXPIRED_TOKEN_MSG = (
-    "[!] Боезапас пуст: токен MRKT истёк (срок жизни ~24 часа), сервер ответил 401.\n"
-    "    Срочно обнови MRKT_TOKEN в .env:\n"
-    "      1. Открой MRKT (https://cdn.tgmrkt.io/) в Telegram Web.\n"
-    "      2. F12 → Network → фильтр 'api.tgmrkt.io' → скопируй заголовок 'authorization'.\n"
-    "      3. Замени значение MRKT_TOKEN в .env на свежее.\n"
-    "      4. Перезапусти терминал."
-)
+_EXPIRED_TOKEN_MSG = "[!] Токен MRKT истёк (HTTP 401). Срочно обнови MRKT_TOKEN в .env."
+
+
+def nano_to_ton(value) -> float:
+    """
+    Единственный канонический конвертер nano → TON.
+    Никаких эвристик 'если число большое — значит нано'.
+    Все API MRKT возвращают цены в нано-TON, всегда делим на 1e9.
+    """
+    try:
+        return float(value) / NANO
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def ton_to_nano(value) -> int:
+    try:
+        return int(round(float(value) * NANO))
+    except (TypeError, ValueError):
+        return 0
 
 
 class MRKTClient:
     """
     Асинхронный клиент API маркетплейса MRKT.
-
-    Авторизация — ТОЛЬКО ручная: токен передаётся через переменную окружения
-    MRKT_TOKEN (или аргумент конструктора). Никакой авто-перевыпуск через
-    Telegram больше не выполняется — Pyrogram отдаёт устаревший Layer 158,
-    а бэкенд MRKT требует Layer 178+ с валидным signature.
+    Авторизация только через MRKT_TOKEN из .env.
     """
 
     def __init__(self, token: str | None = None):
         self.token = token or os.getenv("MRKT_TOKEN")
         self.session: aiohttp.ClientSession | None = None
 
-    # ---------- headers ----------
     @property
     def headers(self) -> dict:
-        _headers = {
+        h = {
             "user-agent": _CHROME_UA,
             "origin": "https://cdn.tgmrkt.io",
             "referer": "https://cdn.tgmrkt.io/",
@@ -66,9 +72,9 @@ class MRKTClient:
             "sec-fetch-site": "cross-site",
         }
         if self.token:
-            _headers["authorization"] = self.token
-            _headers["cookie"] = f"access_token={self.token}"
-        return _headers
+            h["authorization"] = self.token
+            h["cookie"] = f"access_token={self.token}"
+        return h
 
     async def __aenter__(self):
         await self.start()
@@ -87,11 +93,7 @@ class MRKTClient:
             await self.session.close()
         self.session = None
 
-    # ============================================================
-    # Универсальный _request — без авто-авторизации
-    # ============================================================
     async def _request(self, method: str, path: str, retries: int = 5, **kwargs):
-        # Жёсткий стоп-кран №1: токена нет вообще
         if not self.token:
             raise RuntimeError(_NO_TOKEN_MSG)
 
@@ -106,8 +108,6 @@ class MRKTClient:
             attempt += 1
             try:
                 async with self.session.request(method, url, **kwargs) as resp:
-
-                    # Жёсткий стоп-кран №2: токен мёртв
                     if resp.status == 401:
                         raise RuntimeError(_EXPIRED_TOKEN_MSG)
 
@@ -135,16 +135,12 @@ class MRKTClient:
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 30)
 
-    # ============================================================
-    # Публичные методы API — без изменений
-    # ============================================================
+    # ---------- Public API ----------
     async def get_balance(self) -> float:
         try:
             data = await self._request("GET", "/balance")
-            print(f"\n[DEBUG-BALANCE] Сырой ответ сервера: {data}\n")
             if isinstance(data, dict):
-                hard_nano = data.get("hard", 0)
-                return hard_nano / 1_000_000_000
+                return nano_to_ton(data.get("hard", 0))
             return 0.0
         except Exception as e:
             print(f"[!] Ошибка парсинга баланса: {e}")
@@ -164,7 +160,7 @@ class MRKTClient:
         count: int = 1,
         ordering: str = "Price",
         low_to_high: bool = True,
-        backdrop_names: list = None,
+        backdrop_names: list | None = None,
     ) -> list[dict]:
         payload = {
             "backdropNames": backdrop_names or [],
@@ -193,16 +189,20 @@ class MRKTClient:
             data = await self._request("POST", "/gifts/saling", json=payload)
             return data.get("gifts", []) if isinstance(data, dict) else []
         except Exception as e:
-            error_str = str(e)
-            if "DOCTYPE html" in error_str or "502" in error_str:
+            err = str(e)
+            if "DOCTYPE html" in err or "502" in err:
                 print(f"[DEBUG] CF блок (502): {collection_name}")
             else:
                 print(f"[!] Ошибка радара витрины: {e}")
             return []
 
     async def get_collection_orders(
-        self, collection_name: str, count: int = 20, backdrop_names: list = None
+        self, collection_name: str, count: int = 20, backdrop_names: list | None = None
     ) -> list[dict]:
+        """
+        Возвращает Buy Orders (стакан ставок) по коллекции.
+        Это и есть источник "Best Bid" для проверки Liquidity Gap.
+        """
         payload = {
             "backdropNames": backdrop_names or [],
             "collectionNames": [collection_name],
@@ -233,11 +233,18 @@ class MRKTClient:
             print(f"[!] Ошибка радара стакана: {e}")
             return []
 
+    async def get_collection_offers(self, collection_name: str) -> list[dict]:
+        """
+        Алиас для семантической ясности: офферы (Buy Orders) — те же ордера.
+        Используется scanner.get_best_offer.
+        """
+        return await self.get_collection_orders(collection_name, count=10)
+
     async def create_collection_order(
         self,
         collection_name: str,
         price_nano: int,
-        backdrop_name: str = None,
+        backdrop_name: str | None = None,
         price_min_nano: int = 500_000_000,
         quantity: int = 1,
     ) -> dict:
@@ -266,8 +273,7 @@ class MRKTClient:
         return []
 
     async def cancel_offer(self, offer_id: str):
-        payload = {"offerId": offer_id}
-        return await self._request("POST", "/offers/cancel", json=payload)
+        return await self._request("POST", "/offers/cancel", json={"offerId": offer_id})
 
     async def get_inventory(self) -> list[dict]:
         base_payload = {
@@ -294,26 +300,16 @@ class MRKTClient:
             "tgCanBeCraftedFrom": None,
         }
 
-        all_gifts = []
-
-        payload_unlisted = base_payload.copy()
-        payload_unlisted["isListed"] = False
-        try:
-            data_unlisted = await self._request("POST", "/gifts", json=payload_unlisted)
-            if isinstance(data_unlisted, dict) and "gifts" in data_unlisted:
-                all_gifts.extend(data_unlisted["gifts"])
-        except Exception as e:
-            print(f"[!] Ошибка получения инвентаря (холд): {e}")
-
-        payload_listed = base_payload.copy()
-        payload_listed["isListed"] = True
-        try:
-            data_listed = await self._request("POST", "/gifts", json=payload_listed)
-            if isinstance(data_listed, dict) and "gifts" in data_listed:
-                all_gifts.extend(data_listed["gifts"])
-        except Exception as e:
-            print(f"[!] Ошибка получения инвентаря (витрина): {e}")
-
+        all_gifts: list[dict] = []
+        for is_listed in (False, True):
+            payload = {**base_payload, "isListed": is_listed}
+            try:
+                data = await self._request("POST", "/gifts", json=payload)
+                if isinstance(data, dict) and "gifts" in data:
+                    all_gifts.extend(data["gifts"])
+            except Exception as e:
+                tag = "холд" if not is_listed else "витрина"
+                print(f"[!] Ошибка получения инвентаря ({tag}): {e}")
         return all_gifts
 
     async def create_offer(self, gift_sale_id: str, price_nano: int) -> dict:

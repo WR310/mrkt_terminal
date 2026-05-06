@@ -3,6 +3,7 @@ import os
 import asyncio
 import logging
 from typing import Optional
+from db import SELL_FIXED_COST_TON
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
@@ -54,6 +55,7 @@ BTN_ENGINE = "⚙️ Движок"
 BTN_SNIPER = "🎯 Снайпер"
 BTN_OPS = "🛠 Операции"
 BTN_CALC = "🧮 Калькулятор"
+BTN_PNL = "📈 PnL"
 
 
 def main_kb() -> ReplyKeyboardMarkup:
@@ -61,7 +63,7 @@ def main_kb() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text=BTN_STATUS), KeyboardButton(text=BTN_ENGINE)],
             [KeyboardButton(text=BTN_SNIPER), KeyboardButton(text=BTN_OPS)],
-            [KeyboardButton(text=BTN_CALC)],
+            [KeyboardButton(text=BTN_CALC), KeyboardButton(text=BTN_PNL)],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -142,6 +144,14 @@ def calc_inline_kb() -> InlineKeyboardMarkup:
     )
 
 
+def pnl_inline_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data="pnl:refresh")],
+        ]
+    )
+
+
 def discount_inline_kb(target: str) -> InlineKeyboardMarkup:
     """
     Инлайн-клавиатура подстройки скидок (target ∈ engine|sniper|offers|calc).
@@ -187,6 +197,34 @@ def _disc_field(cfg_key: str, default: float = 15.0) -> float:
         return float(cfg.get(cfg_key, default))
     except (TypeError, ValueError):
         return default
+
+
+def _format_pnl_block(title: str, s: dict) -> str:
+    """
+    Форматирует один блок PnL (за 24h / 7d / all).
+    """
+    pnl_net = s["pnl_net_ton"]
+    pnl_emoji = "🟢" if pnl_net >= 0 else "🔴"
+    sign = "+" if pnl_net >= 0 else ""
+    return (
+        f"<b>{title}</b>\n"
+        f"  Сделок: <b>{s['buys_count']}</b> покупок / <b>{s['sells_count']}</b> продаж\n"
+        f"  Вложено: <b>{s['invested_ton']:.3f} TON</b>\n"
+        f"  Получено (грязн.): <b>{s['received_gross_ton']:.3f} TON</b>\n"
+        f"  Получено (чистыми): <b>{s['received_net_ton']:.3f} TON</b>\n"
+        f"  Профит: {pnl_emoji} <b>{sign}{pnl_net:.3f} TON</b>\n"
+        f"  ROI: <b>{s['roi_percent']:.2f}%</b>"
+    )
+
+
+def _format_pnl_report(stats: dict) -> str:
+    return (
+        "<b>📈 PnL — журнал сделок</b>\n"
+        f"Учитываются фиксированные сборы MRKT (~{SELL_FIXED_COST_TON:.2f} TON на продажу).\n\n"
+        f"{_format_pnl_block('🕐 За 24 часа', stats['24h'])}\n\n"
+        f"{_format_pnl_block('📅 За 7 дней', stats['7d'])}\n\n"
+        f"{_format_pnl_block('♾ За всё время', stats['all'])}"
+    )
 
 
 # ============================================================
@@ -481,10 +519,15 @@ class TelegramBot:
 
         @r.message(CalcFSM.waiting_floor, F.text)
         async def calc_floor_input(m: Message, state: FSMContext):
-            # Если пользователь ткнул в нижнюю клавиатуру — отменяем FSM
-            if m.text in {BTN_STATUS, BTN_ENGINE, BTN_SNIPER, BTN_OPS, BTN_CALC}:
+            if m.text in {
+                BTN_STATUS,
+                BTN_ENGINE,
+                BTN_SNIPER,
+                BTN_OPS,
+                BTN_CALC,
+                BTN_PNL,
+            }:
                 await state.clear()
-                # пробрасываем дальше: вызовем соответствующий хендлер вручную
                 return await self._reroute_main_buttons(m, state)
 
             raw = (m.text or "").replace(",", ".").strip()
@@ -500,9 +543,7 @@ class TelegramBot:
 
             disc = _disc_field("calc_discount", 15.0)
             buy_price = floor * (1 - disc / 100.0)
-            # Прикинем чистую прибыль с учётом комиссии маркета 5% (стандарт MRKT)
-            fee = 0.05
-            sell_net = floor * (1 - fee)
+            sell_net = floor - SELL_FIXED_COST_TON
             profit = sell_net - buy_price
             roi = (profit / buy_price * 100.0) if buy_price > 0 else 0.0
 
@@ -511,12 +552,49 @@ class TelegramBot:
                 f"Флор: <b>{floor:.3f} TON</b>\n"
                 f"Дисконт покупки: <b>{disc:.1f}%</b>\n"
                 f"Цена покупки: <b>{buy_price:.3f} TON</b>\n"
-                f"Продажа по флору (за вычетом 5% комиссии): <b>{sell_net:.3f} TON</b>\n"
+                f"Продажа по флору минус фикс. сбор {SELL_FIXED_COST_TON:.2f} TON: "
+                f"<b>{sell_net:.3f} TON</b>\n"
                 f"Профит: <b>{profit:.3f} TON</b>\n"
                 f"ROI: <b>{roi:.2f}%</b>"
             )
             await state.clear()
             await m.answer(txt, reply_markup=main_kb())
+
+        # ============================================================
+        #                     PNL PANEL
+        # ============================================================
+        async def render_pnl_panel(m_or_cb):
+            try:
+                stats = await ctrl.get_pnl()
+            except Exception as e:
+                log.exception("get_pnl failed")
+                txt = f"❌ Ошибка получения PnL: <code>{e}</code>"
+                if isinstance(m_or_cb, CallbackQuery):
+                    await m_or_cb.message.answer(txt, reply_markup=main_kb())
+                else:
+                    await m_or_cb.answer(txt, reply_markup=main_kb())
+                return
+
+            txt = _format_pnl_report(stats)
+            kb = pnl_inline_kb()
+            if isinstance(m_or_cb, CallbackQuery):
+                try:
+                    await m_or_cb.message.edit_text(txt, reply_markup=kb)
+                except Exception:
+                    await m_or_cb.message.answer(txt, reply_markup=kb)
+            else:
+                await m_or_cb.answer(txt, reply_markup=kb)
+
+        @r.message(F.text == BTN_PNL)
+        async def on_pnl_btn(m: Message, state: FSMContext):
+            await state.clear()
+            await m.answer("⏳ Собираю PnL из журнала сделок...")
+            await render_pnl_panel(m)
+
+        @r.callback_query(F.data == "pnl:refresh")
+        async def cb_pnl_refresh(cb: CallbackQuery):
+            await cb.answer("Обновлено")
+            await render_pnl_panel(cb)
 
         # ============================================================
         #                     DISCOUNT FSM (универсальный редактор)
@@ -556,7 +634,14 @@ class TelegramBot:
         @r.message(DiscountFSM.waiting_value, F.text)
         async def disc_manual_input(m: Message, state: FSMContext):
             # Перехват главных кнопок — выходим из FSM и роутим
-            if m.text in {BTN_STATUS, BTN_ENGINE, BTN_SNIPER, BTN_OPS, BTN_CALC}:
+            if m.text in {
+                BTN_STATUS,
+                BTN_ENGINE,
+                BTN_SNIPER,
+                BTN_OPS,
+                BTN_CALC,
+                BTN_PNL,
+            }:
                 await state.clear()
                 return await self._reroute_main_buttons(m, state)
 
@@ -687,6 +772,15 @@ class TelegramBot:
                 f"Текущий дисконт расчёта: <b>{calc_disc}%</b>",
                 reply_markup=calc_inline_kb(),
             )
+        elif text == BTN_PNL:
+            try:
+                stats = await self.controller.get_pnl()
+                await m.answer(_format_pnl_report(stats), reply_markup=pnl_inline_kb())
+            except Exception as e:
+                await m.answer(
+                    f"❌ Ошибка получения PnL: <code>{e}</code>",
+                    reply_markup=main_kb(),
+                )
 
     # ============================================================
     #                     LIFECYCLE

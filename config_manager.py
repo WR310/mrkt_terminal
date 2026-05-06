@@ -13,6 +13,9 @@ DEFAULTS: dict = {
     "sniper_discount": 20.0,
     "calc_discount": 15.0,
     "calc_undercut_ton": 0.001,
+    # ---- Liquidity Gap / Sniper ----
+    "sniper_check_offers": True,  # включает gap-check в Снайпере
+    "sniper_offer_ttl": 12.0,  # сек, TTL кэша Best Bid
     "engine_backdrops": {
         "Любой": True,
         "Black": False,

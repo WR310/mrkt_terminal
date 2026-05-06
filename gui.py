@@ -13,6 +13,7 @@ from engine import run_engine
 from config_manager import load_config, save_config, update_value
 from controller import TerminalController
 from tg_bot import TelegramBot
+from db import SELL_FIXED_COST_TON
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
@@ -1129,7 +1130,7 @@ class MRKTTerminal(ctk.CTk):
 
         buy_price = floor * multiplier
         sell_price = floor - self.calc_undercut_ton
-        profit = sell_price - buy_price
+        profit = sell_price - buy_price - SELL_FIXED_COST_TON
         roi = (profit / buy_price * 100.0) if buy_price > 0 else 0.0
 
         profit_color = "#3ddc84" if profit >= 0 else "#ff6b6b"
@@ -1142,7 +1143,11 @@ class MRKTTerminal(ctk.CTk):
         )
         self.calc_roi_value.configure(text=f"{roi:+.2f} %", text_color=roi_color)
         self.calc_status.configure(
-            text=f"Floor={floor:.4f} TON  |  Discount={discount:.0f}%  |  Undercut={self.calc_undercut_ton:.3f} TON",
+            text=(
+                f"Floor={floor:.4f} | Discount={discount:.0f}% | "
+                f"Undercut={self.calc_undercut_ton:.3f} | "
+                f"FixCost={SELL_FIXED_COST_TON:.2f} TON"
+            ),
             text_color="#9aa0a6",
         )
 

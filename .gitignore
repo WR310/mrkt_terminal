@@ -1,4 +1,6 @@
 .env
-*.session
+*.db
+*.log
 __pycache__/
-data/
+*.pyc
+data/config.json
